@@ -257,15 +257,8 @@ def make_net():
         Conv(3, whiten_width, whiten_kernel_size, padding=0, bias=True),
         nn.GELU(),
         ConvGroup(whiten_width, widths['block1'], batchnorm_momentum),
-        StochasticDepth(
-            ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
-            survival_prob=1.0
-        ), 
-        StochasticDepth(
-            ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
-            survival_prob=1.0
-        ),
-
+        ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
+        ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
         nn.MaxPool2d(3),
         Flatten(),
         nn.Linear(widths['block3'], 10, bias=False),
@@ -402,8 +395,8 @@ def main(run):
         "train_acc": [],
         "val_acc": [],
         "epoch_wall_time": [],
-        "block2_survival": [],
-        "block3_survival": [],
+        "block2_drop": [],
+        "block3_drop": [],
     }
 
     run_start_time = time.time()
@@ -465,21 +458,7 @@ def main(run):
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     for epoch in range(ceil(epochs)):
-        if hyp.get("stochastic_depth", {}).get("enabled", False):
-            frac = epoch / max(ceil(epochs) - 1, 1)
         
-            block2_drop = hyp["stochastic_depth"]["block2_max_drop"] * frac
-            block3_drop = hyp["stochastic_depth"]["block3_max_drop"] * frac
-        
-            block2_survival = 1.0 - block2_drop
-            block3_survival = 1.0 - block3_drop
-        
-            model[3].survival_prob = block2_survival
-            model[4].survival_prob = block3_survival
-        
-            history["block2_survival"].append(block2_survival)
-            history["block3_survival"].append(block3_survival)
-
         epoch_start_time = time.time()
 
         model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
@@ -497,6 +476,25 @@ def main(run):
             loss = loss_fn(outputs, labels).sum()
             optimizer.zero_grad(set_to_none=True)
             loss.backward()
+
+            if hyp.get("stochastic_depth", {}).get("enabled", False):
+                frac = epoch / max(ceil(epochs) - 1, 1)
+            
+                p_block2 = hyp["stochastic_depth"]["block2_max_drop"] * frac
+                p_block3 = hyp["stochastic_depth"]["block3_max_drop"] * frac
+                history["block2_drop"].append(p_block2)
+                history["block3_drop"].append(p_block3)
+
+                for name, p in model.named_parameters():
+                    if p.grad is None:
+                        continue
+            
+                    if "block2" in name and torch.rand(1, device=p.grad.device) < p_block2:
+                        p.grad.zero_()
+            
+                    if "block3" in name and torch.rand(1, device=p.grad.device) < p_block3:
+                        p.grad.zero_()
+
             optimizer.step()
             scheduler.step()
 
@@ -573,7 +571,7 @@ if __name__ == "__main__":
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
 
     log = {
-        "experiment": "drop path",
+        "experiment": "drop path A",
         "metadata": {
             "git_commit": get_git_commit(),
             "python_version": platform.python_version(),
