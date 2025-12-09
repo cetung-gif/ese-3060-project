@@ -66,7 +66,13 @@ hyp = {
         'scaling_factor': 1/9,
         'tta_level': 2,         # the level of test-time augmentation: 0=none, 1=mirror, 2=mirror+translate
     },
+    'stochastic_depth': {
+        'enabled': True,
+        'block2_max_drop': 0.2,   
+        'block3_max_drop': 0.4,   
+    },
 }
+    
 def get_git_commit():
     try:
         return subprocess.check_output(
@@ -221,6 +227,23 @@ class ConvGroup(nn.Module):
         x = self.activ(x)
         return x
 
+class StochasticDepth(nn.Module):
+    def __init__(self, module, survival_prob=1.0):
+        super().__init__()
+        self.module = module
+        self.survival_prob = survival_prob
+
+    def forward(self, x):
+        if not self.training or self.survival_prob == 1.0:
+            return self.module(x)
+    
+        if torch.rand(1, device=x.device) >= self.survival_prob:
+            with torch.no_grad():
+                return torch.zeros_like(self.module(x))
+        else:
+            return self.module(x) / self.survival_prob
+
+
 #############################################
 #            Network Definition             #
 #############################################
@@ -233,9 +256,16 @@ def make_net():
     net = nn.Sequential(
         Conv(3, whiten_width, whiten_kernel_size, padding=0, bias=True),
         nn.GELU(),
-        ConvGroup(whiten_width,     widths['block1'], batchnorm_momentum),
-        ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
-        ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
+        ConvGroup(whiten_width, widths['block1'], batchnorm_momentum),
+        StochasticDepth(
+            ConvGroup(widths['block1'], widths['block2'], batchnorm_momentum),
+            survival_prob=1.0
+        ), 
+        StochasticDepth(
+            ConvGroup(widths['block2'], widths['block3'], batchnorm_momentum),
+            survival_prob=1.0
+        ),
+
         nn.MaxPool2d(3),
         Flatten(),
         nn.Linear(widths['block3'], 10, bias=False),
@@ -372,6 +402,8 @@ def main(run):
         "train_acc": [],
         "val_acc": [],
         "epoch_wall_time": [],
+        "block2_survival": [],
+        "block3_survival": [],
     }
 
     run_start_time = time.time()
@@ -433,6 +465,21 @@ def main(run):
     total_time_seconds += 1e-3 * starter.elapsed_time(ender)
 
     for epoch in range(ceil(epochs)):
+        if hyp.get("stochastic_depth", {}).get("enabled", False):
+            frac = epoch / max(ceil(epochs) - 1, 1)
+        
+            block2_drop = hyp["stochastic_depth"]["block2_max_drop"] * frac
+            block3_drop = hyp["stochastic_depth"]["block3_max_drop"] * frac
+        
+            block2_survival = 1.0 - block2_drop
+            block3_survival = 1.0 - block3_drop
+        
+            model[3].survival_prob = block2_survival
+            model[4].survival_prob = block3_survival
+        
+            history["block2_survival"].append(block2_survival)
+            history["block3_survival"].append(block3_survival)
+
         epoch_start_time = time.time()
 
         model[0].bias.requires_grad = (epoch < hyp['opt']['whiten_bias_epochs'])
@@ -526,7 +573,7 @@ if __name__ == "__main__":
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
 
     log = {
-        "experiment": "baseline",
+        "experiment": "drop path",
         "metadata": {
             "git_commit": get_git_commit(),
             "python_version": platform.python_version(),
