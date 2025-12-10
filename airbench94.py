@@ -542,10 +542,11 @@ if __name__ == "__main__":
         "results": {
             "accs": accs.tolist(),
             "mean_acc": float(accs.mean()),
-            "std_acc": float(accs.std()),
-            "gpu_time_mean": float(sum(gpu_times) / len(gpu_times)),
-            "wall_time_mean": float(sum(wall_times) / len(wall_times)),
+            "std_acc": float(accs.std(unbiased=True)),
+            "gpu_times": gpu_times,
+            "wall_times": wall_times,
         },
+
         "histories": histories,
         "seeds": seeds,
         "raw": results,

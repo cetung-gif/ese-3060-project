@@ -479,9 +479,9 @@ def main(run):
 
             if hyp.get("stochastic_depth", {}).get("enabled", False):
                 frac = epoch / max(ceil(epochs) - 1, 1)
-            
                 p_block2 = hyp["stochastic_depth"]["block2_max_drop"] * frac
                 p_block3 = hyp["stochastic_depth"]["block3_max_drop"] * frac
+
                 history["block2_drop"].append(p_block2)
                 history["block3_drop"].append(p_block3)
 
@@ -571,7 +571,7 @@ if __name__ == "__main__":
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
 
     log = {
-        "experiment": "drop path A",
+        "experiment": "drop mid + linear/backloaded",
         "metadata": {
             "git_commit": get_git_commit(),
             "python_version": platform.python_version(),
@@ -587,9 +587,9 @@ if __name__ == "__main__":
         "results": {
             "accs": accs.tolist(),
             "mean_acc": float(accs.mean()),
-            "std_acc": float(accs.std()),
-            "gpu_time_mean": float(sum(gpu_times) / len(gpu_times)),
-            "wall_time_mean": float(sum(wall_times) / len(wall_times)),
+            "std_acc": float(accs.std(unbiased=True)),
+            "gpu_times": gpu_times,
+            "wall_times": wall_times,
         },
         "histories": histories,
         "seeds": seeds,
