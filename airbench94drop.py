@@ -478,7 +478,8 @@ def main(run):
             loss.backward()
 
             if hyp.get("stochastic_depth", {}).get("enabled", False):
-                frac = epoch / max(ceil(epochs) - 1, 1)
+                frac = 1.0 - epoch / max(ceil(epochs) - 1, 1)
+
                 p_block2 = hyp["stochastic_depth"]["block2_max_drop"] * frac
                 p_block3 = hyp["stochastic_depth"]["block3_max_drop"] * frac
 
@@ -571,7 +572,7 @@ if __name__ == "__main__":
     print('Mean: %.4f    Std: %.4f' % (accs.mean(), accs.std()))
 
     log = {
-        "experiment": "drop mid + linear/backloaded",
+        "experiment": "frontloaded (mid)",
         "metadata": {
             "git_commit": get_git_commit(),
             "python_version": platform.python_version(),

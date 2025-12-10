@@ -25,7 +25,6 @@ groups = {}
 for log_path in glob.glob(os.path.join(LOG_ROOT, "*", "log.pt")):
     dirname = os.path.basename(os.path.dirname(log_path))
 
-    # experiment name = directory prefix before last underscore
     if "_" in dirname:
         exp_name = "_".join(dirname.split("_")[:-1])
     else:
