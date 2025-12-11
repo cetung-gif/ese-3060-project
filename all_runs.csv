@@ -1,0 +1,5 @@
+run_id,seed,use_dd_vsl,final_val_loss,wall_time_s,total_tokens,mean_tps
+dd_2,760,True,3.8754,1632.375,209715200,128472.8
+dd_1,67,True,3.86,1588.14,209715200,132052.0
+baseline_1,67,False,3.7686,1682.392,209715200,124653.3
+baseline_2,760,False,3.7702,1682.005,209715200,124682.1
