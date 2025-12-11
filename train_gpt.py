@@ -324,7 +324,7 @@ class Hyperparameters:
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 5100 # number of iterations to run
+    num_iterations : int = 800 # number of iterations to run
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
@@ -337,7 +337,7 @@ class Hyperparameters:
     vsl_match_baseline_tokens : bool = True
 
     # evaluation and logging hyperparams
-    val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
+    val_loss_every : int = 100 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
     save_every : int = 0 # every how many steps to save the checkpoint? 0 for only at the end
 args = Hyperparameters()
@@ -358,7 +358,7 @@ torch.cuda.manual_seed_all(seed)
 np.random.seed(seed)
 
 if master_process:
-    print(f"Random seed: {seed}")
+    print(f"Seed: {seed}")
     try:
         import subprocess
         git_commit = subprocess.check_output(
@@ -593,7 +593,7 @@ for step in range(args.num_iterations + 1):
             train_loss = loss.detach()
         
         # backward pass
-        if i < train_accumulation_steps:
+        if i < train_accum_steps:
             x, y = active_loader.next_batch()
             with model.no_sync(): # there's no need to sync gradients every accumulation step
                 loss.backward()
