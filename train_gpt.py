@@ -1,5 +1,4 @@
 # NOTE: record from https://github.com/KellerJordan/modded-nanogpt/blob/master/records/track_1_short/2024-10-14_ModernArch/dabaaddd-237c-4ec9-939d-6608a9ed5e27.txt
-====================================================================================================
 import os
 import sys
 with open(sys.argv[0]) as f:
@@ -319,8 +318,8 @@ class DistributedDataLoader:
 @dataclass
 class Hyperparameters:
     # data hyperparams
-    input_bin : str = 'data/fineweb10B/fineweb_train_*.bin' # input .bin to train on
-    input_val_bin : str = 'data/fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
+    input_bin : str = 'fineweb10B/fineweb_train_*.bin' # input .bin to train on
+    input_val_bin : str = 'fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
     batch_size : int = 8*64 # batch size, in sequences, across all devices
     device_batch_size : int = 64 # batch size, in sequences, per device
@@ -330,6 +329,13 @@ class Hyperparameters:
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
+    #experiment
+    use_dd_vsl : bool = False
+    vsl_sequence_sizes : tuple = (256, 512, 1024)
+    vsl_batch_multipliers : tuple = (4, 2, 1)
+    vsl_mix_weights : tuple = (4, 2, 1)
+    vsl_match_baseline_tokens : bool = True
+
     # evaluation and logging hyperparams
     val_loss_every : int = 125 # every how many steps to evaluate val loss? 0 for only at the end
     val_tokens : int = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
@@ -346,23 +352,93 @@ device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
+seed = 67
+torch.manual_seed(seed)
+torch.cuda.manual_seed_all(seed)
+np.random.seed(seed)
 
-# convenience variables
-B, T = args.device_batch_size, args.sequence_length
-# calculate the number of steps to take in the val loop.
-assert args.val_tokens % (B * T * ddp_world_size) == 0
-val_steps = args.val_tokens // (B * T * ddp_world_size)
-# calculate the steps of gradient accumulation required to attain the desired global batch size.
-assert args.batch_size % (B * ddp_world_size) == 0
-train_accumulation_steps = args.batch_size // (B * ddp_world_size)
-
-# load tokens
-train_loader = DistributedDataLoader(args.input_bin, B, T, ddp_rank, ddp_world_size)
-val_loader = DistributedDataLoader(args.input_val_bin, B, T, ddp_rank, ddp_world_size)
 if master_process:
-    print(f"Training DataLoader: total number of tokens: {train_loader.ntok_total} across {len(train_loader.files)} files")
-    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} across {len(val_loader.files)} files")
-x, y = train_loader.next_batch()
+    print(f"Random seed: {seed}")
+    try:
+        import subprocess
+        git_commit = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'], text=True
+        ).strip()
+    except Exception:
+        git_commit = "unknown"
+    print(f"git commit: {git_commit}")
+else:
+    git_commit = "non_master"
+
+
+B_base, T_max = args.device_batch_size, args.sequence_length
+assert args.val_tokens % (B_base * T_max * ddp_world_size) == 0
+val_steps = args.val_tokens // (B_base * T_max * ddp_world_size)
+assert args.batch_size % (B_base * ddp_world_size) == 0
+train_accumulation_steps_base = args.batch_size // (B_base * ddp_world_size)
+
+if not args.use_dd_vsl:
+    bucket_sequence_lengths = [T_max]
+    bucket_batch_sizes = [B_base]
+    bucket_probs = [1.0]
+
+    train_loaders = [
+        DistributedDataLoader(args.input_bin, B_base, T_max, ddp_rank, ddp_world_size)
+    ]
+    val_loader = DistributedDataLoader(args.input_val_bin, B_base, T_max, ddp_rank, ddp_world_size)
+
+else:
+    # Filter sequence sizes to those not exceeding the model's maximum context length
+    bucket_sequence_lengths = [L for L in args.vsl_sequence_sizes if L <= T_max]
+    assert len(bucket_sequence_lengths) > 0, "No VSL sequence sizes <= max sequence_length"
+    assert len(bucket_sequence_lengths) == len(args.vsl_batch_multipliers), \
+        "vsl_sequence_sizes and vsl_batch_multipliers must have the same length"
+
+    bucket_batch_sizes = [B_base * m for m in args.vsl_batch_multipliers[:len(bucket_sequence_lengths)]]
+
+    train_loaders = [
+        DistributedDataLoader(args.input_bin, B_bucket, L_bucket, ddp_rank, ddp_world_size)
+        for (B_bucket, L_bucket) in zip(bucket_batch_sizes, bucket_sequence_lengths)
+    ]
+
+    val_loader = DistributedDataLoader(args.input_val_bin, B_base, T_max, ddp_rank, ddp_world_size)
+
+    # Length-based curriculum
+    if hasattr(args, "vsl_mix_weights") and len(args.vsl_mix_weights) >= len(bucket_sequence_lengths):
+        mix_weights = np.array(args.vsl_mix_weights[:len(bucket_sequence_lengths)], dtype=np.float64)
+    else:
+        mix_weights = 1.0 / np.array(bucket_sequence_lengths, dtype=np.float64)
+    mix_weights = np.maximum(mix_weights, 1e-8)
+    bucket_probs = (mix_weights / mix_weights.sum()).tolist()
+
+    if args.vsl_match_baseline_tokens:
+        tokens_per_step_baseline = args.batch_size * T_max
+        tokens_per_step_bucket = np.array(
+            [B_bucket * L_bucket * ddp_world_size
+             for (B_bucket, L_bucket) in zip(bucket_batch_sizes, bucket_sequence_lengths)],
+            dtype=np.float64,
+        )
+        expected_tokens_step_vsl = float((np.array(bucket_probs) * tokens_per_step_bucket).sum())
+        total_tokens_target = tokens_per_step_baseline * args.num_iterations
+        new_num_iterations = int(total_tokens_target / max(expected_tokens_step_vsl, 1.0))
+        if master_process:
+            print(f"[VSL] Adjusting num_iterations from {args.num_iterations} to {new_num_iterations} "
+                  f"to match baseline num tokens")
+        args.num_iterations = new_num_iterations
+
+if master_process:
+    print(f"Training DataLoader: using {len(train_loaders)} bucket(s)")
+    for idx, (B_bucket, L_bucket, p_bucket) in enumerate(
+        zip(bucket_batch_sizes, bucket_sequence_lengths, bucket_probs)
+    ):
+        global_tokens_per_step = B_bucket * L_bucket * ddp_world_size
+        print(f"  bucket {idx}: seq_len={L_bucket}, device_batch_size={B_bucket}, "
+              f"global_tokens/step={global_tokens_per_step}, sampling_prob={p_bucket:.3f}")
+    print(f"Validation DataLoader: total number of tokens: {val_loader.ntok_total} "
+          f"across {len(val_loader.files)} files")
+
+x, y = train_loaders[0].next_batch()
+
 
 # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. suggested to me by @Grad62304977.
 # this originates from Karpathy's experiments.
@@ -409,6 +485,9 @@ if master_process:
         f.write('='*100 + '\n')
         f.write(code)
         f.write('='*100 + '\n')
+        f.write(f"Seed: {seed}\n")
+        f.write(f"Git commit: {git_commit}\n")
+        f.write('='*100 + '\n')
         # log information about the hardware/software environment this is running on
         # and print the full `nvidia-smi` to file
         f.write(f"Running pytorch {torch.version.__version__} compiled for CUDA {torch.version.cuda}\nnvidia-smi:\n")
@@ -421,10 +500,36 @@ training_time_ms = 0
 # start the clock
 torch.cuda.synchronize()
 t0 = time.time()
+
+# reset all train loaders
+for loader in train_loaders:
+    loader.reset()
+
+tokens_seen = 0
 # begin training
-train_loader.reset()
 for step in range(args.num_iterations + 1):
     last_step = (step == args.num_iterations)
+    
+    # Choose bucket / sequence length
+    if len(train_loaders) == 1:
+        bucket_idx = 0
+    else:
+        bucket_idx = int(np.random.choice(
+            len(train_loaders),
+            p=np.array(bucket_probs, dtype=np.float64),
+        ))
+    active_loader = train_loaders[bucket_idx]
+    current_seq_len = bucket_sequence_lengths[bucket_idx]
+    current_device_batch_size = bucket_batch_sizes[bucket_idx]
+
+    if not args.use_dd_vsl:
+        train_accum_steps = train_accumulation_steps_base
+    else:
+        denom = current_device_batch_size * ddp_world_size
+        train_accum_steps = args.batch_size // denom
+        if train_accum_steps < 1:
+            train_accum_steps = 1
+
     # This effectively ignores timing first 10 steps, which are slower for weird reasons.
     # Alternately, and slightly more correctly in terms of benchmarking, we could do 10
     # steps with dummy data first, and then re-initialize the model and reset the loader.
@@ -479,21 +584,24 @@ for step in range(args.num_iterations + 1):
 
     # --------------- TRAINING SECTION BEGIN -----------------
     model.train()
-    for i in range(1, train_accumulation_steps+1):
+    x, y = active_loader.next_batch()
+
+    for i in range(1, train_accum_steps+1):
         # forward pass
         with ctx:
             _, loss = model(x, y, return_logits=False)
             train_loss = loss.detach()
-        # advance the dataset for the next batch
-        x, y = train_loader.next_batch()
+        
         # backward pass
         if i < train_accumulation_steps:
+            x, y = active_loader.next_batch()
             with model.no_sync(): # there's no need to sync gradients every accumulation step
                 loss.backward()
         else:
             loss.backward() # just sync on the last step
     for p in model.parameters():
-        p.grad /= train_accumulation_steps
+        if p.grad is not None:
+            p.grad /= train_accum_steps
     # step the optimizers and schedulers
     for opt, sched in zip(optimizers, schedulers):
         opt.step()
@@ -502,13 +610,35 @@ for step in range(args.num_iterations + 1):
     model.zero_grad(set_to_none=True)
     # --------------- TRAINING SECTION END -------------------
     # everything that follows now is just diagnostics, prints, logging, etc.
+    
+    tokens_this_step = current_seq_len * current_device_batch_size * ddp_world_size * train_accum_steps
+    tokens_seen += tokens_this_step
 
     #dist.all_reduce(train_loss, op=dist.ReduceOp.AVG) # all-reducing the training loss would be more correct in terms of logging, but slower
     if master_process:
         approx_time = training_time_ms + 1000 * (time.time() - t0)
-        print(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms")
+        tokens_per_sec = tokens_seen / max(approx_time / 1000.0, 1e-6)
+        print(
+            f"step:{step+1}/{args.num_iterations} "
+            f"train_loss:{train_loss:.4f} "
+            f"seq_len:{current_seq_len} "
+            f"bucket:{bucket_idx} "
+            f"tokens_seen:{tokens_seen} "
+            f"tokens_per_sec:{tokens_per_sec:.1f} "
+            f"time_ms:{approx_time:.0f} "
+            f"step_avg_ms:{approx_time/timed_steps:.2f}"
+        )
         with open(logfile, "a") as f:
-            f.write(f"step:{step+1}/{args.num_iterations} train_loss:{train_loss.item():.4f} train_time:{approx_time:.0f}ms step_avg:{approx_time/timed_steps:.2f}ms\n")
+            f.write(
+                f"step:{step+1}/{args.num_iterations} "
+                f"train_loss:{train_loss:.4f} "
+                f"seq_len:{current_seq_len} "
+                f"bucket:{bucket_idx} "
+                f"tokens_seen:{tokens_seen} "
+                f"tokens_per_sec:{tokens_per_sec:.1f} "
+                f"time_ms:{approx_time:.0f} "
+                f"step_avg_ms:{approx_time/timed_steps:.2f}\n"
+            )
 
 if master_process:
     print(f"peak memory consumption: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB")
