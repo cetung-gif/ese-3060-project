@@ -321,19 +321,19 @@ class Hyperparameters:
     input_bin : str = 'fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8*32 # batch size, in sequences, across all devices
+    batch_size : int = 4 * 32 # batch size, in sequences, across all devices
     device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
-    num_iterations : int = 800 # number of iterations to run
+    num_iterations : int = 1600 # number of iterations to run
     learning_rate : float = 0.0036
     warmup_iters : int = 0
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     #experiment
     use_dd_vsl : bool = True
-    vsl_sequence_sizes : tuple = (256, 512, 1024)
-    vsl_batch_multipliers : tuple = (4, 2, 1)
-    vsl_mix_weights : tuple = (4, 2, 1)
+    vsl_sequence_sizes = (256, 512, 1024)
+    vsl_batch_multipliers = (4, 2, 1)
+    vsl_mix_weights = (3, 2, 1)
     vsl_match_baseline_tokens : bool = True
 
     # evaluation and logging hyperparams
@@ -352,7 +352,7 @@ device = f'cuda:{ddp_local_rank}'
 torch.cuda.set_device(device)
 print(f"using device: {device}")
 master_process = (ddp_rank == 0) # this process will do logging, checkpointing etc.
-seed = 67
+seed = 760
 torch.manual_seed(seed)
 torch.cuda.manual_seed_all(seed)
 np.random.seed(seed)
@@ -374,7 +374,10 @@ else:
 
 B_base, T_max = args.device_batch_size, args.sequence_length
 assert args.val_tokens % (B_base * T_max * ddp_world_size) == 0
-val_batch_size = 8
+if not args.use_dd_vsl:
+    val_batch_size = B_base
+else:
+    val_batch_size = max(8, B_base // 2)
 assert args.val_tokens % (val_batch_size * T_max * ddp_world_size) == 0
 val_steps = args.val_tokens // (val_batch_size * T_max * ddp_world_size)
 assert args.batch_size % (B_base * ddp_world_size) == 0
@@ -430,7 +433,7 @@ else:
         args.num_iterations = new_num_iterations
 
 if master_process:
-    print(f"Training DataLoader: using {len(train_loaders)} bucket(s)")
+    print(f"Training DataLoader: {len(train_loaders)} buckets")
     for idx, (B_bucket, L_bucket, p_bucket) in enumerate(
         zip(bucket_batch_sizes, bucket_sequence_lengths, bucket_probs)
     ):
@@ -450,11 +453,7 @@ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-if not args.use_dd_vsl:
-    model = torch.compile(model)
-else:
-    if master_process:
-        print("disabling torch.compile to avoid Inductor bug")
+
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
