@@ -321,8 +321,8 @@ class Hyperparameters:
     input_bin : str = 'fineweb10B/fineweb_train_*.bin' # input .bin to train on
     input_val_bin : str = 'fineweb10B/fineweb_val_*.bin' # input .bin to eval validation loss on
     # optimization hyperparams
-    batch_size : int = 8*64 # batch size, in sequences, across all devices
-    device_batch_size : int = 64 # batch size, in sequences, per device
+    batch_size : int = 8*32 # batch size, in sequences, across all devices
+    device_batch_size : int = 32 # batch size, in sequences, per device
     sequence_length : int = 1024 # sequence length, in tokens
     num_iterations : int = 800 # number of iterations to run
     learning_rate : float = 0.0036
@@ -330,7 +330,7 @@ class Hyperparameters:
     warmdown_iters : int = 1450 # number of iterations of linear warmup/warmdown for triangular or trapezoidal schedule
     weight_decay : float = 0
     #experiment
-    use_dd_vsl : bool = False
+    use_dd_vsl : bool = True
     vsl_sequence_sizes : tuple = (256, 512, 1024)
     vsl_batch_multipliers : tuple = (4, 2, 1)
     vsl_mix_weights : tuple = (4, 2, 1)
@@ -371,9 +371,12 @@ else:
     git_commit = "non_master"
 
 
+
 B_base, T_max = args.device_batch_size, args.sequence_length
 assert args.val_tokens % (B_base * T_max * ddp_world_size) == 0
-val_steps = args.val_tokens // (B_base * T_max * ddp_world_size)
+val_batch_size = 8
+assert args.val_tokens % (val_batch_size * T_max * ddp_world_size) == 0
+val_steps = args.val_tokens // (val_batch_size * T_max * ddp_world_size)
 assert args.batch_size % (B_base * ddp_world_size) == 0
 train_accumulation_steps_base = args.batch_size // (B_base * ddp_world_size)
 
@@ -385,7 +388,7 @@ if not args.use_dd_vsl:
     train_loaders = [
         DistributedDataLoader(args.input_bin, B_base, T_max, ddp_rank, ddp_world_size)
     ]
-    val_loader = DistributedDataLoader(args.input_val_bin, B_base, T_max, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(args.input_val_bin, val_batch_size, T_max, ddp_rank, ddp_world_size)
 
 else:
     # Filter sequence sizes to those not exceeding the model's maximum context length
@@ -401,7 +404,7 @@ else:
         for (B_bucket, L_bucket) in zip(bucket_batch_sizes, bucket_sequence_lengths)
     ]
 
-    val_loader = DistributedDataLoader(args.input_val_bin, B_base, T_max, ddp_rank, ddp_world_size)
+    val_loader = DistributedDataLoader(args.input_val_bin, val_batch_size, T_max, ddp_rank, ddp_world_size)
 
     # Length-based curriculum
     if hasattr(args, "vsl_mix_weights") and len(args.vsl_mix_weights) >= len(bucket_sequence_lengths):
@@ -447,7 +450,11 @@ model = GPT(GPTConfig(vocab_size=num_vocab, n_layer=12, n_head=6, n_embd=768))
 model = model.cuda()
 if hasattr(config, "coordinate_descent_tuning"):
     config.coordinate_descent_tuning = True # suggested by @Chillee
-model = torch.compile(model)
+if not args.use_dd_vsl:
+    model = torch.compile(model)
+else:
+    if master_process:
+        print("disabling torch.compile to avoid Inductor bug")
 # here we wrap model into DDP container
 model = DDP(model, device_ids=[ddp_local_rank])
 raw_model = model.module # always contains the "raw" unwrapped model
